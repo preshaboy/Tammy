@@ -1,7 +1,9 @@
 import os
 import re
-from datetime import datetime
+import collections
+from datetime import datetime, timezone
 import discord
+from discord import app_commands
 from discord.ext import commands
 import requests
 import urllib.parse
@@ -28,6 +30,28 @@ SYSTEM_PROMPT = (
 )
 
 URL_PATTERN = re.compile(r"https?://[^\s)\]>]+")
+VERDICT_PATTERN = re.compile(r"This is\s*\*\*\[?([^\]\*]+?)\]?\*\*")
+
+# In-memory only: resets on restart/redeploy
+FACT_CHECK_HISTORY = collections.deque(maxlen=200)
+VERDICT_COUNTS = collections.Counter()
+_synced = False
+
+
+def record_fact_check(message, claim, text):
+    """Store a successful fact-check in the in-memory history."""
+    match = VERDICT_PATTERN.search(text)
+    verdict = match.group(1).strip() if match else "Unknown"
+    guild = message.guild.name if message.guild else "DM"
+    channel = getattr(message.channel, "name", None) or "DM"
+    FACT_CHECK_HISTORY.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "location": f"{guild}/{channel}",
+        "user": message.author.display_name,
+        "claim": " ".join(claim.split())[:120],
+        "verdict": verdict,
+    })
+    VERDICT_COUNTS[verdict] += 1
 
 
 def format_month_year(raw_date):
@@ -121,9 +145,43 @@ async def fetch_tavily_search(query: str) -> str:
         print(f"Tavily connection error: {e}")
     return ""
 
+@bot.tree.command(name="history", description="Show recent fact-checks")
+@app_commands.describe(limit="Number of entries to show (1-10)")
+async def history(interaction: discord.Interaction, limit: int = 5):
+    limit = max(1, min(limit, 10))
+    if not FACT_CHECK_HISTORY:
+        await interaction.response.send_message("No fact-checks yet.", ephemeral=True)
+        return
+    lines = []
+    for entry in list(FACT_CHECK_HISTORY)[::-1][:limit]:
+        date = entry["timestamp"][:10]
+        lines.append(f'• {date} — {entry["verdict"]} — "{entry["claim"]}" — {entry["user"]}')
+    await interaction.response.send_message("\n".join(lines)[:MAX_REPLY_LENGTH], ephemeral=True)
+
+
+@bot.tree.command(name="stats", description="Show fact-check statistics")
+async def stats(interaction: discord.Interaction):
+    total = sum(VERDICT_COUNTS.values())
+    if not total:
+        await interaction.response.send_message("No fact-checks yet.", ephemeral=True)
+        return
+    breakdown = "\n".join(f"• {verdict}: {count}" for verdict, count in VERDICT_COUNTS.most_common())
+    requesters = len({entry["user"] for entry in FACT_CHECK_HISTORY})
+    reply = f"Total fact-checks: {total}\n{breakdown}\nUnique requesters (recent history): {requesters}"
+    await interaction.response.send_message(reply[:MAX_REPLY_LENGTH], ephemeral=True)
+
+
 @bot.event
 async def on_ready():
+    global _synced
     print(f"Tammy is online as {bot.user}")
+    if not _synced:
+        try:
+            synced = await bot.tree.sync()
+            _synced = True
+            print(f"Synced {len(synced)} slash command(s): {[c.name for c in synced]}")
+        except Exception as e:
+            print(f"Slash command sync failed: {e}")
 
 @bot.event
 async def on_message(message):
@@ -250,6 +308,12 @@ async def on_message(message):
                 raise ValueError("Empty reply from GreenPT")
                 
             await message.channel.send(text[:1900])
+
+            if text.startswith("This is"):
+                try:
+                    record_fact_check(message, claim, text)
+                except Exception as e:
+                    print(f"Failed to record fact-check: {e}")
             
         except Exception as e:
             print(f"GreenPT error: {e}")
