@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import collections
 from datetime import datetime, timezone
 import discord
@@ -32,14 +33,56 @@ SYSTEM_PROMPT = (
 URL_PATTERN = re.compile(r"https?://[^\s)\]>]+")
 VERDICT_PATTERN = re.compile(r"This is\s*\*\*\[?([^\]\*]+?)\]?\*\*")
 
-# In-memory only: resets on restart/redeploy
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATA_FILE = os.path.join(DATA_DIR, "fact_checks.json")
+
+# Persisted to DATA_FILE (on the mounted volume) so it survives restarts/redeploys
 FACT_CHECK_HISTORY = collections.deque(maxlen=200)
 VERDICT_COUNTS = collections.Counter()
 _synced = False
 
 
+def load_store():
+    """Load persisted history and verdict counts from DATA_FILE, if present."""
+    global VERDICT_COUNTS
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        history = data.get("history", [])
+        counts = data.get("verdict_counts", {})
+        if not isinstance(history, list) or not isinstance(counts, dict):
+            raise ValueError("Unexpected data format in fact check store")
+        FACT_CHECK_HISTORY.clear()
+        FACT_CHECK_HISTORY.extend(history)
+        VERDICT_COUNTS = collections.Counter(counts)
+    except Exception as e:
+        FACT_CHECK_HISTORY.clear()
+        VERDICT_COUNTS = collections.Counter()
+        print(f"Failed to load fact check store: {e}")
+
+
+def save_store():
+    """Atomically write history and verdict counts to DATA_FILE."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                {"history": list(FACT_CHECK_HISTORY), "verdict_counts": dict(VERDICT_COUNTS)},
+                f,
+            )
+        os.replace(tmp, DATA_FILE)
+    except Exception as e:
+        print(f"Failed to save fact check store: {e}")
+
+
+load_store()
+
+
 def record_fact_check(message, claim, text):
-    """Store a successful fact-check in the in-memory history."""
+    """Store a successful fact-check in history and persist it to disk."""
     match = VERDICT_PATTERN.search(text)
     verdict = match.group(1).strip() if match else "Unknown"
     guild = message.guild.name if message.guild else "DM"
@@ -52,6 +95,7 @@ def record_fact_check(message, claim, text):
         "verdict": verdict,
     })
     VERDICT_COUNTS[verdict] += 1
+    save_store()
 
 
 def format_month_year(raw_date):
